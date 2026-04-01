@@ -22,6 +22,7 @@ import { searchTracks, type SpotifyTrack } from "@/lib/spotify";
 import { getAudioFeaturesBySpotifyId, type AudioFeatures } from "@/lib/soundcharts";
 import { parseCamelot } from "@/lib/camelot";
 import { CURATED_TRACKS, type CuratedTrack } from "@/data/tracks";
+import { detectScene, getRelatedArtists } from "@/lib/scene";
 
 export type RecommendationLabel =
   | "Perfect Match"
@@ -49,6 +50,7 @@ interface ScoredEntry {
   camelot: string;
   score: number;
   camelotRelationship: "exact" | "adjacent" | "opposite" | "key-only" | "none";
+  scene: ReturnType<typeof detectScene>;
 }
 
 const MAX_RESULTS = 10;
@@ -159,13 +161,19 @@ function deriveLabel(
 
 function scoreCuratedPool(
   sourceId: string,
-  sourceFeatures: AudioFeatures
+  sourceFeatures: AudioFeatures,
+  sourceScene: ReturnType<typeof detectScene>
 ): ScoredEntry[] {
   const seenArtists = new Map<string, number>();
   const entries: ScoredEntry[] = [];
 
   for (const t of CURATED_TRACKS) {
     if (t.spotifyId === sourceId) continue;
+
+    // Exclude candidates in a *different* known scene.
+    // "unknown" candidates pass through — they may still be relevant.
+    const candidateScene = detectScene(t.artist);
+    if (sourceScene !== "unknown" && candidateScene !== "unknown" && candidateScene !== sourceScene) continue;
 
     const { score, relationship } = computeScore(
       t.camelot, t.bpm, t.key, sourceFeatures
@@ -181,6 +189,7 @@ function scoreCuratedPool(
       camelot: t.camelot,
       score,
       camelotRelationship: relationship,
+      scene: candidateScene,
     });
   }
 
@@ -237,11 +246,16 @@ function deduplicateSearchPool(pool: SpotifyTrack[], sourceKey: string): Spotify
 
 async function scoreSearchPool(
   pool: SpotifyTrack[],
-  sourceFeatures: AudioFeatures
+  sourceFeatures: AudioFeatures,
+  sourceScene: ReturnType<typeof detectScene>
 ): Promise<ScoredEntry[]> {
   const enriched = await Promise.all(
     pool.map(async (track): Promise<ScoredEntry | null> => {
       try {
+        // Exclude candidates in a different known scene before spending an API call.
+        const candidateScene = detectScene(track.artists[0]?.name ?? "");
+        if (sourceScene !== "unknown" && candidateScene !== "unknown" && candidateScene !== sourceScene) return null;
+
         const features = await getAudioFeaturesBySpotifyId(track.id);
         if (!features) return null;
 
@@ -260,6 +274,7 @@ async function scoreSearchPool(
           camelot: features.camelot,
           score,
           camelotRelationship: relationship,
+          scene: candidateScene,
         };
       } catch {
         return null;
@@ -321,10 +336,29 @@ export async function getRecommendations(
   sourceFeatures: AudioFeatures
 ): Promise<Recommendation[]> {
   const existingIds = new Set<string>([sourceTrack.id]);
+  const sourceScene = detectScene(sourceTrack.artists[0]?.name ?? "");
+
+  // Helper: split a scored list into same-scene and unknown-scene partitions.
+  // Known different-scene entries were already excluded inside the score functions.
+  function partition(entries: ScoredEntry[]) {
+    const sameScene: ScoredEntry[] = [];
+    const unknownScene: ScoredEntry[] = [];
+    for (const e of entries) {
+      if (sourceScene === "unknown" || e.scene === sourceScene) {
+        sameScene.push(e);
+      } else {
+        unknownScene.push(e); // scene === "unknown" only — different-known already excluded
+      }
+    }
+    return { sameScene, unknownScene };
+  }
 
   // Tier 1: curated dataset — fast, no API calls, best quality.
-  const curatedScored = scoreCuratedPool(sourceTrack.id, sourceFeatures);
-  const results = applyCapAndLabel(curatedScored, sourceFeatures, existingIds, ARTIST_CAP, MAX_RESULTS);
+  const curatedScored = scoreCuratedPool(sourceTrack.id, sourceFeatures, sourceScene);
+  const { sameScene: c1, unknownScene: cu1 } = partition(curatedScored);
+
+  // Fill from same-scene first.
+  const results = applyCapAndLabel(c1, sourceFeatures, existingIds, ARTIST_CAP, MAX_RESULTS);
 
   if (results.length >= MIN_RESULTS) return results;
 
@@ -334,26 +368,45 @@ export async function getRecommendations(
   const bpmBand = Math.round(sourceFeatures.bpm / 10) * 10;
   const keyName = sourceFeatures.key;
 
-  const queries = [
-    artistName,
-    trackName,
-    `${artistName} ${trackName}`.trim(),
+  const relatedArtists = getRelatedArtists(artistName);
+  const sceneQueries = relatedArtists.length > 0
+    ? relatedArtists
+    : [artistName, trackName, `${artistName} ${trackName}`.trim()];
+
+  const broadQueries = [
     `${keyName} ${bpmBand} bpm`,
     `${bpmBand} bpm`,
     `${keyName} minor`,
     `${keyName} major`,
-  ].filter(Boolean);
+  ];
+
+  const queries = [...sceneQueries, ...broadQueries].filter(Boolean);
 
   const sourceKey = dedupKey(sourceTrack.name, sourceTrack.artists[0]?.name ?? "");
   const rawPool = await buildSearchPool(sourceTrack.id, queries);
   const pool = deduplicateSearchPool(rawPool, sourceKey);
 
   if (pool.length > 0) {
-    const searchScored = await scoreSearchPool(pool, sourceFeatures);
-    const fallbackResults = applyCapAndLabel(
-      searchScored, sourceFeatures, existingIds, ARTIST_CAP, MAX_RESULTS - results.length
+    const searchScored = await scoreSearchPool(pool, sourceFeatures, sourceScene);
+    const { sameScene: s2, unknownScene: su2 } = partition(searchScored);
+
+    // Fill same-scene search results next.
+    const s2Results = applyCapAndLabel(s2, sourceFeatures, existingIds, ARTIST_CAP, MAX_RESULTS - results.length);
+    results.push(...s2Results);
+  }
+
+  // Only use unknown-scene candidates if still below MIN_RESULTS.
+  if (results.length < MIN_RESULTS) {
+    const unknownPool = [...cu1, ...partition(
+      // re-use already-computed curated unknown entries; search unknowns need a fresh call
+      // but we avoid re-scoring — collect them from the last search run if available
+      curatedScored.filter((e) => e.scene === "unknown")
+    ).unknownScene];
+    const unknownResults = applyCapAndLabel(
+      unknownPool.sort((a, b) => b.score - a.score),
+      sourceFeatures, existingIds, ARTIST_CAP, MIN_RESULTS - results.length
     );
-    results.push(...fallbackResults);
+    results.push(...unknownResults);
   }
 
   return results;
